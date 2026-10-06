@@ -361,6 +361,11 @@ const firebaseConfig = {
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
       新建任务
     </button>
+    <button class="btn btn-ghost" onclick="openTrashModal()" title="回收站" style="position:relative;">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+      回收站
+      <span id="trash-badge" style="position:absolute;top:-4px;right:-4px;background:#dc2626;color:#fff;font-size:10px;padding:1px 4px;border-radius:10px;display:none;">0</span>
+    </button>
     <button class="btn btn-ghost" onclick="clearAllTasks()" title="清空全部任务" style="color:#dc2626;border-color:#fecaca;">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
       清空
@@ -454,6 +459,24 @@ const firebaseConfig = {
   </div>
 </div>
 
+<!-- Trash Modal -->
+<div class="modal-overlay" id="trash-modal" onclick="if(event.target===this)closeTrashModal()">
+  <div class="modal" style="max-width:700px;width:90%;max-height:80vh;display:flex;flex-direction:column;">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+      <h2 style="margin:0;">🗑️ 回收站</h2>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <span id="trash-count" style="font-size:13px;color:var(--text-secondary);">0 个任务</span>
+        <button class="btn btn-ghost" onclick="emptyTrash()" style="color:#dc2626;border-color:#fecaca;font-size:12px;padding:6px 12px;">清空回收站</button>
+      </div>
+    </div>
+    <div id="trash-list" style="overflow-y:auto;flex:1;border-top:1px solid var(--border);padding-top:12px;"></div>
+    <div class="modal-actions" style="border-top:1px solid var(--border);padding-top:16px;margin-top:16px;">
+      <button class="btn btn-ghost" onclick="closeTrashModal()">关闭</button>
+      <button class="btn btn-primary" onclick="restoreAllTrash()">全部恢复</button>
+    </div>
+  </div>
+</div>
+
 <!-- Toast -->
 <div class="toast" id="toast"></div>
 
@@ -477,10 +500,12 @@ const firebaseConfig = {
 // ========== State ==========
 let db = null;
 let tasksRef = null;
+let trashRef = null;
 let presenceRef = null;
 let myPresenceRef = null;
 let myId = 'user-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 let tasks = [];
+let trashTasks = [];
 let collaborators = [];
 let searchKeyword = '';
 let editingPriority = 'medium';
@@ -498,6 +523,7 @@ function initApp() {
     firebase.initializeApp(firebaseConfig);
     db = firebase.database();
     tasksRef = db.ref('work-schedule/tasks');
+    trashRef = db.ref('work-schedule/trash');
     presenceRef = db.ref('work-schedule/presence');
     myPresenceRef = presenceRef.child(myId);
 
@@ -571,6 +597,18 @@ function setupRealtimeListeners() {
     tasks = Object.entries(data).map(([id, t]) => ({ id, ...t }));
     autoCleanDoneTasks();
     render();
+  });
+
+  // Trash listener
+  trashRef.on('value', (snapshot) => {
+    const data = snapshot.val() || {};
+    trashTasks = Object.entries(data).map(([id, t]) => ({ id, ...t }));
+    updateTrashBadge();
+    const trashModal = document.getElementById('trash-modal');
+    if (trashModal && trashModal.classList.contains('active')) {
+      renderTrashList();
+    }
+    autoCleanTrash();
   });
 
   // Connection state
@@ -768,10 +806,10 @@ function autoCleanDoneTasks() {
     return (now - new Date(t.completedAt).getTime()) > AUTO_CLEAN_DAYS * 24 * 60 * 60 * 1000;
   });
   expired.forEach(t => {
-    tasksRef.child(t.id).remove();
+    moveToTrash(t);
   });
   if (expired.length > 0) {
-    showToast(`🧹 已自动清理 ${expired.length} 个超过 ${AUTO_CLEAN_DAYS} 天的已完成任务`);
+    showToast(`🧹 已自动清理 ${expired.length} 个超过 ${AUTO_CLEAN_DAYS} 天的已完成任务（已移至回收站）`);
   }
 }
 
@@ -803,9 +841,125 @@ function toggleTask(id) {
 function deleteTask(id) {
   const task = tasks.find(t => t.id === id);
   if (!task) return;
-  if (!confirm(`确定删除「${task.title}」吗？`)) return;
-  tasksRef.child(id).remove();
-  showToast('🗑️ 已删除');
+  if (!confirm(`确定删除「${task.title}」吗？可在回收站恢复。`)) return;
+  moveToTrash(task);
+  showToast('🗑️ 已移到回收站');
+}
+
+function moveToTrash(task) {
+  const trashItem = { ...task, deletedAt: new Date().toISOString(), deletedBy: myName || '匿名' };
+  trashRef.child(task.id).set(trashItem);
+  tasksRef.child(task.id).remove();
+}
+
+function restoreFromTrash(id) {
+  const task = trashTasks.find(t => t.id === id);
+  if (!task) return;
+  const restored = { ...task };
+  delete restored.deletedAt;
+  delete restored.deletedBy;
+  tasksRef.child(id).set(restored);
+  trashRef.child(id).remove();
+  showToast('✅ 已恢复');
+}
+
+function permanentlyDelete(id) {
+  const task = trashTasks.find(t => t.id === id);
+  if (!task) return;
+  if (!confirm(`确定永久删除「${task.title}」吗？此操作不可恢复！`)) return;
+  trashRef.child(id).remove();
+  showToast('🗑️ 已永久删除');
+}
+
+// ========== Trash Modal ==========
+const TRASH_AUTO_CLEAN_DAYS = 30;
+
+function openTrashModal() {
+  document.getElementById('trash-modal').classList.add('active');
+  renderTrashList();
+}
+
+function closeTrashModal() {
+  document.getElementById('trash-modal').classList.remove('active');
+}
+
+function updateTrashBadge() {
+  const badge = document.getElementById('trash-badge');
+  if (!badge) return;
+  const count = trashTasks.length;
+  if (count > 0) {
+    badge.textContent = count > 99 ? '99+' : count;
+    badge.style.display = 'block';
+  } else {
+    badge.style.display = 'none';
+  }
+  const countEl = document.getElementById('trash-count');
+  if (countEl) countEl.textContent = `${count} 个任务`;
+}
+
+function renderTrashList() {
+  const container = document.getElementById('trash-list');
+  if (!container) return;
+  const countEl = document.getElementById('trash-count');
+  if (countEl) countEl.textContent = `${trashTasks.length} 个任务`;
+
+  if (trashTasks.length === 0) {
+    container.innerHTML = `<div style="text-align:center;padding:40px 0;color:var(--text-secondary);">
+      <div style="font-size:48px;margin-bottom:12px;">🗑️</div>
+      <p>回收站是空的</p>
+    </div>`;
+    return;
+  }
+
+  const sorted = [...trashTasks].sort((a, b) => new Date(b.deletedAt || 0) - new Date(a.deletedAt || 0));
+  const priorityLabels = { high: '高优先级', medium: '中优先级', low: '低优先级' };
+
+  container.innerHTML = sorted.map(t => {
+    const deletedDays = t.deletedAt ? Math.floor((Date.now() - new Date(t.deletedAt).getTime()) / (24 * 60 * 60 * 1000)) : 0;
+    const daysLeft = TRASH_AUTO_CLEAN_DAYS - deletedDays;
+    const daysInfo = daysLeft <= 3 ? `<span style="color:#dc2626;font-size:11px;">⚠️ ${daysLeft}天后永久删除</span>` : `<span style="color:#94a3b8;font-size:11px;">${daysLeft}天后自动清理</span>`;
+    return `<div style="display:flex;align-items:flex-start;gap:12px;padding:12px;border:1px solid var(--border);border-radius:10px;margin-bottom:8px;background:#fff;">
+      <div style="flex:1;min-width:0;">
+        <div style="font-weight:600;color:var(--text);margin-bottom:4px;display:flex;align-items:center;gap:8px;">
+          <span style="text-decoration:${t.status === 'done' ? 'line-through' : 'none'};opacity:${t.status === 'done' ? '0.6' : '1'};">${escapeHtml(t.title)}</span>
+          <span class="priority-tag priority-${t.priority}" style="font-size:10px;padding:1px 6px;">${priorityLabels[t.priority] || '中优先级'}</span>
+        </div>
+        ${t.desc ? `<div style="font-size:13px;color:var(--text-secondary);margin-bottom:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(t.desc)}</div>` : ''}
+        <div style="font-size:11px;color:var(--text-secondary);display:flex;gap:12px;flex-wrap:wrap;">
+          <span>状态：${t.status === 'done' ? '已完成' : '待完成'}</span>
+          ${t.deletedBy ? `<span>删除者：@${escapeHtml(t.deletedBy)}</span>` : ''}
+          ${daysInfo}
+        </div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:4px;flex-shrink:0;">
+        <button class="btn btn-primary" onclick="restoreFromTrash('${t.id}')" style="font-size:12px;padding:6px 12px;">恢复</button>
+        <button class="btn btn-ghost" onclick="permanentlyDelete('${t.id}')" style="font-size:12px;padding:6px 12px;color:#dc2626;border-color:#fecaca;">删除</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function restoreAllTrash() {
+  if (trashTasks.length === 0) { showToast('⚠️ 回收站是空的'); return; }
+  if (!confirm(`确定恢复全部 ${trashTasks.length} 个任务吗？`)) return;
+  trashTasks.forEach(t => restoreFromTrash(t.id));
+  showToast(`✅ 已恢复全部 ${trashTasks.length} 个任务`);
+}
+
+function emptyTrash() {
+  if (trashTasks.length === 0) { showToast('⚠️ 回收站是空的'); return; }
+  if (!confirm(`确定永久清空回收站的 ${trashTasks.length} 个任务吗？此操作不可恢复！`)) return;
+  trashRef.remove();
+  showToast('🗑️ 回收站已清空');
+}
+
+function autoCleanTrash() {
+  const now = Date.now();
+  const expired = trashTasks.filter(t => {
+    if (!t.deletedAt) return false;
+    return (now - new Date(t.deletedAt).getTime()) > TRASH_AUTO_CLEAN_DAYS * 24 * 60 * 60 * 1000;
+  });
+  expired.forEach(t => trashRef.child(t.id).remove());
 }
 
 // ========== Modal ==========
@@ -917,9 +1071,9 @@ document.querySelectorAll('.task-list').forEach(list => {
 // ========== Clear All ==========
 function clearAllTasks() {
   if (tasks.length === 0) { showToast('⚠️ 没有任务可清空'); return; }
-  if (!confirm(`确定清空全部 ${tasks.length} 个任务吗？此操作不可撤销！`)) return;
-  tasksRef.remove();
-  showToast('🗑️ 已清空全部任务');
+  if (!confirm(`确定将全部 ${tasks.length} 个任务移到回收站吗？可在回收站恢复。`)) return;
+  tasks.forEach(t => moveToTrash(t));
+  showToast('🗑️ 已全部移到回收站');
 }
 
 // ========== Import / Export ==========
